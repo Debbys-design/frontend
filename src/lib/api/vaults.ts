@@ -16,6 +16,12 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ *   GET  /api/v1/vaults/{id}/reconciliation
+ *   → VaultReconciliationReport
+ *
+ *   POST /api/v1/vaults/{id}/reconciliation   (on-demand run)
+ *   → VaultReconciliationReport
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -75,6 +81,71 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation report types (issue #218)
+//
+// The nightly reconciliation job treats chain state as the source of truth
+// and the backend ledger as a cache. It is a read-only comparator: it never
+// mutates backend state, it only produces a per-vault drift report that the
+// operator console renders for triage.
+// ---------------------------------------------------------------------------
+
+/** Fields compared by the reconciliation job. */
+export type ReconciliationField =
+  | "total_share_supply"
+  | "collateral_balance"
+  | "last_finalized_epoch_id"
+  | "last_finalized_epoch_nav"
+  | "pending_deposit_count"
+  | "pending_withdrawal_count"
+  | "cumulative_fees_distributed";
+
+/**
+ * Per-field comparison status.
+ *
+ * - `pass`          — within tolerance (or exactly equal for zero-tolerance fields)
+ * - `drift`         — delta exceeds the configured tolerance
+ * - `indeterminate` — value cannot be compared (e.g. missing price data for NAV,
+ *                     archived/TTL-expired contract entry). Never reported as drift.
+ */
+export type ReconciliationFieldStatus = "pass" | "drift" | "indeterminate";
+
+/** Overall report status. */
+export type ReconciliationStatus = "pass" | "fail" | "indeterminate";
+
+/** One compared field within a reconciliation report. */
+export interface ReconciliationFieldResult {
+  field: ReconciliationField;
+  status: ReconciliationFieldStatus;
+  /** Value recomputed from chain state (null when indeterminate). */
+  chainValue: number | null;
+  /** Value read from the backend ledger (null when indeterminate). */
+  ledgerValue: number | null;
+  /** chainValue - ledgerValue (null when indeterminate). */
+  delta: number | null;
+  /** Absolute tolerance applied to this field (0 for zero-tolerance fields). */
+  tolerance: number;
+  /** Human-readable explanation, especially for indeterminate fields. */
+  note?: string;
+}
+
+/** A single reconciliation report record for one vault. */
+export interface VaultReconciliationReport {
+  id: string;
+  vaultId: string;
+  /** ISO timestamp when the job ran. */
+  ranAt: string;
+  /** Pinned ledger sequence the comparison was made against (not "now"). */
+  ledgerSequence: number;
+  /** Whether the run was scheduled (nightly) or triggered on-demand. */
+  trigger: "scheduled" | "on_demand";
+  status: ReconciliationStatus;
+  /** Per-field deltas and pass/fail status. */
+  fields: ReconciliationFieldResult[];
+  /** Fields that exceeded tolerance and raised an alert. */
+  alertedFields: ReconciliationField[];
 }
 
 // ---------------------------------------------------------------------------
@@ -159,82 +230,66 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
     ],
     userPosition: null,
   },
 ];
 
 // ---------------------------------------------------------------------------
-// Public adapter
+// Reconciliation mock data
 // ---------------------------------------------------------------------------
 
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
+const MOCK_RECONCILIATION: Record<string, VaultReconciliationReport> = {
+  "xlm-cc-v1": {
+    id: "recon-xlm-cc-v1-20260928",
+    vaultId: "xlm-cc-v1",
+    ranAt: "2026-09-28T02:00:00Z",
+    ledgerSequence: 512340,
+    trigger: "scheduled",
+    status: "pass",
+    fields: [
+      { field: "total_share_supply", status: "pass", chainValue: 272552, ledgerValue: 272552, delta: 0, tolerance: 0 },
+      { field: "collateral_balance", status: "pass", chainValue: 284000, ledgerValue: 284000, delta: 0, tolerance: 0 },
+      { field: "last_finalized_epoch_id", status: "pass", chainValue: 46, ledgerValue: 46, delta: 0, tolerance: 0 },
+      { field: "last_finalized_epoch_nav", status: "pass", chainValue: 1.042, ledgerValue: 1.042, delta: 0, tolerance: 0.0001 },
+      { field: "pending_deposit_count", status: "pass", chainValue: 3, ledgerValue: 3, delta: 0, tolerance: 0 },
+      { field: "pending_withdrawal_count", status: "pass", chainValue: 1, ledgerValue: 1, delta: 0, tolerance: 0 },
+      { field: "cumulative_fees_distributed", status: "pass", chainValue: 1240.5, ledgerValue: 1240.5, delta: 0, tolerance: 0.01 },
+    ],
+    alertedFields: [],
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Adapter
+// ---------------------------------------------------------------------------
+
+const USE_MOCK = process.env.NEXT_PUBLIC_VAULTS !== "live";
+
+/** Fetch the latest reconciliation report for a vault (operator console). */
+export async function fetchVaultReconciliation(
+  vaultId: string,
+): Promise<VaultReconciliationReport | null> {
+  if (USE_MOCK) {
+    return MOCK_RECONCILIATION[vaultId] ?? null;
   }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
+  const res = await fetch(`/api/v1/vaults/${vaultId}/reconciliation`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Failed to fetch reconciliation for ${vaultId}`);
+  return (await res.json()) as VaultReconciliationReport;
 }
 
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
+/** Trigger an on-demand reconciliation run for a vault. */
+export async function runVaultReconciliation(
+  vaultId: string,
+): Promise<VaultReconciliationReport> {
+  if (USE_MOCK) {
+    const existing = MOCK_RECONCILIATION[vaultId];
+    if (existing) return { ...existing, trigger: "on_demand", ranAt: new Date().toISOString() };
+    throw new Error(`No reconciliation data for ${vaultId}`);
   }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
+  const res = await fetch(`/api/v1/vaults/${vaultId}/reconciliation`, { method: "POST" });
+  if (!res.ok) throw new Error(`Failed to run reconciliation for ${vaultId}`);
+  return (await res.json()) as VaultReconciliationReport;
 }
