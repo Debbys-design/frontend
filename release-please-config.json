@@ -4,6 +4,13 @@
     ".": {
       "release-type": "node",
       "package-name": "zenith-frontend"
+    },
+    "contracts": {
+      "release-type": "simple",
+      "package-name": "zenith-vault-contracts",
+      "changelog-path": "contracts/CHANGELOG.md",
+      "include-component-in-tag": true,
+      "component": "vault-contracts"
     }
   }
 }
