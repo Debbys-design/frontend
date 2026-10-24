@@ -11,6 +11,10 @@
       "changelog-path": "contracts/CHANGELOG.md",
       "include-component-in-tag": true,
       "component": "vault-contracts"
+    },
+    "packages/vault-sdk": {
+      "release-type": "node",
+      "package-name": "@zenith-options/vault-sdk"
     }
   }
 }
